@@ -1,3 +1,5 @@
+import re
+
 import frappe
 from frappe import _
 from openai import OpenAI
@@ -30,6 +32,19 @@ def get_openai_models():
 	"""
 	client = get_open_ai_client()
 	return client.models.list()
+
+
+def is_reasoning_model(model: str | None) -> bool:
+	"""
+	o-series and gpt-5 onwards reject temperature and top_p, and take a reasoning effort instead.
+	"""
+	# Matched on the model name, so a family outside the o<n> / gpt-<n> pattern needs adding here
+	match = re.match(r"(o|gpt-)(\d+)", model or "")
+	if not match:
+		return False
+
+	prefix, version = match.groups()
+	return prefix == "o" or int(version) >= 5
 
 
 code_interpreter_file_types = [

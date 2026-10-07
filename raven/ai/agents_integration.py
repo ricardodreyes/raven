@@ -28,6 +28,7 @@ from agents import (
 )
 from frappe import _
 from openai import AsyncOpenAI
+from openai.types.shared import Reasoning
 
 from .functions import (
 	cancel_document,
@@ -38,6 +39,18 @@ from .functions import (
 	submit_document,
 	update_document,
 )
+from .openai_client import code_interpreter_file_types, is_reasoning_model
+
+
+def get_model_settings(bot_doc) -> ModelSettings:
+	"""
+	Reasoning models reject temperature and top_p, so they only get the bot's reasoning effort.
+	"""
+	if not is_reasoning_model(bot_doc.model):
+		return ModelSettings(temperature=bot_doc.temperature, top_p=bot_doc.top_p)
+
+	effort = bot_doc.reasoning_effort
+	return ModelSettings(reasoning=Reasoning(effort=effort) if effort else None)
 
 
 class RavenAgentManager:
@@ -155,9 +168,14 @@ class RavenAgentManager:
 			and self.bot_doc.model_provider == "OpenAI"
 		):
 			try:
-				# Create CodeInterpreterTool with proper configuration
+				# Files from the bot's file sources go into the container so code can read them
+				container = {"type": "auto"}
+				file_ids = self.bot_doc.get_openai_file_ids(code_interpreter_file_types)
+				if file_ids:
+					container["file_ids"] = file_ids
+
 				code_interpreter_tool = CodeInterpreterTool(
-					tool_config={"type": "code_interpreter", "container": {"type": "auto"}}
+					tool_config={"type": "code_interpreter", "container": container}
 				)
 
 				self.tools.append(code_interpreter_tool)
@@ -281,63 +299,19 @@ class RavenAgentManager:
 		return tools
 
 	def _create_file_search_tool(self):
-		"""Create a file search tool for OpenAI bots using SDK's FileSearchTool"""
-		try:
-			from agents import FileSearchTool
+		"""Create a file search tool over the bot's vector store"""
+		# Bots that only had their vector store on the retired Assistant get a new one on first use
+		if not self.bot_doc.openai_vector_store_id:
+			self.bot_doc.sync_vector_store()
 
-			# First check if bot has a vector store ID directly stored
-			vector_store_ids = []
-
-			# Check if bot has openai_vector_store_id field
-			if hasattr(self.bot_doc, "openai_vector_store_id") and self.bot_doc.openai_vector_store_id:
-				vector_store_ids = [self.bot_doc.openai_vector_store_id]
-
-			# If not found on bot, check the assistant
-			elif hasattr(self.bot_doc, "openai_assistant_id") and self.bot_doc.openai_assistant_id:
-				try:
-					# Create a synchronous client for assistant operations
-					from openai import OpenAI
-
-					api_key = self.settings.get_password("openai_api_key")
-					sync_client = OpenAI(
-						api_key=api_key,
-						organization=self.settings.openai_organisation_id,
-						project=self.settings.openai_project_id if self.settings.openai_project_id else None,
-					)
-
-					assistant = sync_client.beta.assistants.retrieve(self.bot_doc.openai_assistant_id)
-
-					# Check if assistant has vector store IDs in tool_resources
-					if hasattr(assistant, "tool_resources") and assistant.tool_resources:
-						# Access the vector store IDs
-						file_search = getattr(assistant.tool_resources, "file_search", None)
-						if file_search and hasattr(file_search, "vector_store_ids"):
-							vs_ids = file_search.vector_store_ids
-							if vs_ids:
-								vector_store_ids = vs_ids
-
-				except Exception as e:
-					frappe.log_error(
-						f"Error retrieving assistant: {str(e)}\n{traceback.format_exc()}", "File Search Tool Error"
-					)
-
-			# If still no vector store, log and return None
-			if not vector_store_ids:
-				return None
-
-			file_search_tool = FileSearchTool(
-				vector_store_ids=vector_store_ids,
-				max_num_results=5,
-				include_search_results=True,  # Include the actual search results
-			)
-
-			return file_search_tool
-
-		except ImportError:
+		if not self.bot_doc.openai_vector_store_id:
 			return None
-		except Exception as e:
-			frappe.log_error(f"Error creating FileSearchTool: {str(e)}", "File Search Tool Error")
-			return None
+
+		return FileSearchTool(
+			vector_store_ids=[self.bot_doc.openai_vector_store_id],
+			max_num_results=5,
+			include_search_results=True,  # Include the actual search results
+		)
 
 	def _get_bot_function(self, doctype: str):
 		"""Get bot function configuration for a DocType"""
@@ -428,12 +402,7 @@ IMPORTANT: When calling tools, the SDK will handle the tool execution automatica
 
 			instructions = instructions + tools_instruction
 
-		# Create model settings
-		model_settings = ModelSettings(temperature=self.bot_doc.temperature, top_p=self.bot_doc.top_p)
-
-		# Add reasoning_effort if available (for o-series models)
-		if hasattr(self.bot_doc, "reasoning_effort") and self.bot_doc.reasoning_effort:
-			model_settings.reasoning_effort = self.bot_doc.reasoning_effort
+		model_settings = get_model_settings(self.bot_doc)
 
 		# Create agent - ALWAYS pass empty list instead of None for tools
 		# Get the model from the provider

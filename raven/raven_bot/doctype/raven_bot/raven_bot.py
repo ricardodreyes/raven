@@ -1,18 +1,11 @@
 # Copyright (c) 2026, Frappe Technologies Pvt. Ltd. and contributors
 # For license information, please see license.txt
 
-import json
-
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from openai import APIConnectionError
 
-from raven.ai.openai_client import (
-	code_interpreter_file_types,
-	file_search_file_types,
-	get_open_ai_client,
-)
+from raven.ai.openai_client import file_search_file_types, get_open_ai_client
 from raven.utils import get_raven_user
 
 
@@ -101,194 +94,26 @@ class RavenBot(Document):
 
 			self.db_set("raven_user", raven_user.name)
 
-		if self.is_ai_bot:
-			# Only create OpenAI assistant if using OpenAI provider (not for Agents SDK)
-			if self.model_provider == "OpenAI":
-				# Skip assistant creation if we're using Agents SDK even with OpenAI
-				# TODO: In future, we should completely phase out assistant creation
-				if not self.openai_assistant_id:
-					self.create_openai_assistant()
-				else:
-					self.update_openai_assistant()
-			else:
-				# For Local LLM or future Agents SDK, no assistant needed
-				if self.openai_assistant_id:
-					# Clear assistant ID if switching from OpenAI to Local LLM
-					self.db_set("openai_assistant_id", None)
-					return
-
-	def before_insert(self):
-		if self.is_ai_bot and not self.openai_assistant_id:
-			# Only create OpenAI assistant if using OpenAI provider (not for Agents SDK)
-			if self.model_provider == "OpenAI":
-				# Skip assistant creation for Local LLM
-				self.create_openai_assistant()
-			elif self.model_provider == "Local LLM":
-				# For Local LLM, we don't need an OpenAI assistant
-				return
+		# Bots run on the Agents SDK, which reads the vector store directly
+		if self.is_ai_bot and self.model_provider == "OpenAI" and self.enable_file_search:
+			self.sync_vector_store()
 
 	def on_trash(self):
-		if self.openai_assistant_id:
-			self.delete_openai_assistant()
+		if self.openai_vector_store_id:
+			self.delete_vector_store()
 
 		if self.raven_user:
 			frappe.db.set_value("Raven User", self.raven_user, "bot", None)
 			self.db_set("raven_user", None)
 			frappe.delete_doc("Raven User", self.raven_user)
 
-	def create_openai_assistant(self):
-		# Create an OpenAI Assistant for the bot (legacy - being phased out for Agents SDK)
-		# Check again to ensure we're not creating for Local LLM
-		if self.model_provider == "Local LLM":
-			return
-
-		client = get_open_ai_client()
-
-		# Sometimes users face an issue with the OpenAI API returning an error for "model_not_found"
-		# This is usually because the user has not added funds to their OpenAI account.
-		# We need to show this error to the user if the openAI API returns an error for "model_not_found"
-
-		model = self.model or "gpt-4o"
-
-		reasoning_effort = self.reasoning_effort or "medium"
-
-		try:
-			assistant = client.beta.assistants.create(
-				instructions=self.instruction,
-				model=model,
-				name=self.bot_name,
-				description=self.description or "",
-				tools=self.get_tools_for_assistant(),
-				tool_resources=self.get_tool_resources_for_assistant(),
-				reasoning_effort=reasoning_effort if model.startswith("o") else None,
-				temperature=self.temperature or 1,
-				top_p=self.top_p or 1,
-			)
-			# Update the tools which were activated for the bot
-			self.db_set("openai_assistant_id", assistant.id)
-			self.check_and_update_enabled_tools(assistant)
-
-		except APIConnectionError as e:
-			frappe.throw(
-				_(
-					"Connection to OpenAI API failed. Please check your Organization ID and API Key for any extra spaces. Error: {0}"
-				).format(e)
-			)
-		except Exception as e:
-			if "model_not_found" in str(e):
-				frappe.throw(
-					_(
-						f"<strong>There was an error creating the agent in OpenAI.</strong><br/>It is possible that your OpenAI account does not have enough funds or the model {model} is not available. Please add funds to your OpenAI account and try again.<br><br/>Error: {e}"
-					)
-				)
-			else:
-				frappe.throw(str(e))
-
-	def update_openai_assistant(self):
-		# Update the OpenAI Assistant for the bot (legacy - being phased out for Agents SDK)
-
-		# Additional check because it is being used in Raven AI Function
-		if not self.is_ai_bot:
-			return
-
-		# Don't update assistant for Local LLM bots
-		if self.model_provider == "Local LLM":
-			return
-
-		client = get_open_ai_client()
-
-		model = self.model or "gpt-4o"
-		reasoning_effort = self.reasoning_effort or "medium"
-
-		try:
-			assistant = client.beta.assistants.update(
-				self.openai_assistant_id,
-				instructions=self.instruction,
-				name=self.bot_name,
-				description=self.description or "",
-				tools=self.get_tools_for_assistant(),
-				tool_resources=self.get_tool_resources_for_assistant(),
-				model=model,
-				reasoning_effort=reasoning_effort if model.startswith("o") else None,
-				temperature=self.temperature or 1,
-				top_p=self.top_p or 1,
-			)
-			self.check_and_update_enabled_tools(assistant)
-		except Exception as e:
-			if "model_not_found" in str(e):
-				frappe.throw(
-					_(
-						f"<strong>There was an error updating the agent in OpenAI.</strong><br/>It is possible that your OpenAI account does not have enough funds or the model {model} is not available. Please check your account and try again.<br><br/>Error: {e}"
-					)
-				)
-			else:
-				frappe.throw(str(e))
-
-	def check_and_update_enabled_tools(self, assistant):
-		# Check if the tools which were activated for the bot are still available
-		# If not, deactivate them
-		try:
-			available_tools = [tool.type for tool in assistant.tools]
-
-			code_interpreter_enabled = "code_interpreter" in available_tools
-			file_search_enabled = "file_search" in available_tools
-
-			if self.enable_code_interpreter and not code_interpreter_enabled:
-				self.db_set("enable_code_interpreter", 0)
-				frappe.msgprint(
-					_(
-						"The code interpreter tool is not available for the model {0}, hence it has been disabled."
-					).format(self.model)
-				)
-
-			if self.enable_file_search and not file_search_enabled:
-				self.db_set("enable_file_search", 0)
-				frappe.msgprint(
-					_(
-						"The file search tool is not available for the model {0}, hence it has been disabled."
-					).format(self.model)
-				)
-		except Exception as e:
-			frappe.log_error(
-				f"Raven AI Bot Tool Check Error for {self.name}",
-				str(e),
-			)
-
-	def get_tools_for_assistant(self):
-		# Add the function to the assistant
-		tools = []
-
-		if self.enable_file_search:
-			tools.append(
-				{
-					"type": "file_search",
-				}
-			)
-
-		if self.enable_code_interpreter:
-			tools.append(
-				{
-					"type": "code_interpreter",
-				}
-			)
-
-		for f in self.bot_functions:
-			function_def = frappe.db.get_value("Raven AI Function", f.function, "function_definition")
-			if function_def:
-				tools.append({"type": "function", "function": json.loads(function_def)})
-
-		return tools
-
-	def get_tool_resources_for_assistant(self):
-		if not self.enable_file_search and not self.enable_code_interpreter:
-			return None
-
-		# Check if the bot has any file sources
-		if not self.file_sources:
-			return None
-
-		# Join file sources with Raven AI Bot Files
+	def get_openai_file_ids(self, file_types: list[str]) -> list[str]:
+		"""
+		OpenAI file IDs of the bot's file sources whose type is in file_types
+		"""
 		file_source_ids = [f.file for f in self.file_sources]
+		if not file_source_ids:
+			return []
 
 		files = frappe.get_all(
 			"Raven AI File Source",
@@ -296,49 +121,31 @@ class RavenBot(Document):
 			fields=["file_type", "openai_file_id"],
 		)
 
-		# Some files can be added as a resource for both file search and code interpreter
+		return [f.openai_file_id for f in files if f.file_type.lower() in file_types]
 
-		code_interpreter_files = [
-			f.openai_file_id for f in files if f.file_type.lower() in code_interpreter_file_types
-		]
+	def sync_vector_store(self):
+		"""
+		Keep the bot's vector store in step with its file search sources
+		"""
+		file_ids = self.get_openai_file_ids(file_search_file_types)
 
-		tool_resources = {}
-
-		if code_interpreter_files:
-			tool_resources["code_interpreter"] = {"file_ids": code_interpreter_files}
-
-		file_search_files = [
-			f.openai_file_id for f in files if f.file_type.lower() in file_search_file_types
-		]
-
-		# Create a vector store for the assistant if it doesn't exist. Else update the existing vector store
-
-		if file_search_files:
-			if not self.openai_vector_store_id:
-				self.create_vector_store(file_search_files)
-			else:
-				self.update_vector_store(file_search_files)
-
-			tool_resources["file_search"] = {"vector_store_ids": [self.openai_vector_store_id]}
-
-		# Check if the tool resources are empty
-		if tool_resources.get("file_search") or tool_resources.get("code_interpreter"):
-			return tool_resources
-		else:
-			return None
+		if self.openai_vector_store_id:
+			self.update_vector_store(file_ids)
+		elif file_ids:
+			self.create_vector_store(file_ids)
 
 	def create_vector_store(self, file_ids: list[str]):
-		# Create a new vector store for the assistant
+		# Create a new vector store for the bot
 		client = get_open_ai_client()
 		vector_store = client.vector_stores.create(
 			name=self.name,
 			file_ids=file_ids,
 		)
 
-		self.openai_vector_store_id = vector_store.id
+		self.db_set("openai_vector_store_id", vector_store.id, update_modified=False)
 
 	def update_vector_store(self, file_ids: list[str]):
-		# Update the vector store for the assistant
+		# Update the vector store for the bot
 		client = get_open_ai_client()
 
 		existing_vector_store_files = client.vector_stores.files.list(
@@ -364,17 +171,13 @@ class RavenBot(Document):
 					file_id=file_id,
 				)
 
-	def delete_openai_assistant(self):
-		# Delete the OpenAI Assistant for the bot
-		# Delete the vector store for the assistant
+	def delete_vector_store(self):
 		try:
 			client = get_open_ai_client()
-			client.beta.assistants.delete(self.openai_assistant_id)
-			if self.openai_vector_store_id:
-				client.vector_stores.delete(self.openai_vector_store_id)
+			client.vector_stores.delete(self.openai_vector_store_id)
 		except Exception:
 			frappe.log_error(
-				f"Error deleting OpenAI Assistant {self.openai_assistant_id} for bot {self.name}"
+				f"Error deleting OpenAI vector store {self.openai_vector_store_id} for bot {self.name}"
 			)
 
 	# Raven Bot Methods

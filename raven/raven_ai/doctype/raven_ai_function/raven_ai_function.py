@@ -513,15 +513,6 @@ class RavenAIFunction(Document):
 
 		self.function_definition = json.dumps(function_definition, indent=4)
 
-	def on_update(self):
-		# Update all the bots that use this function
-
-		bots = frappe.get_all("Raven Bot Functions", filters={"function": self.name}, pluck="parent")
-
-		for bot in bots:
-			bot = frappe.get_doc("Raven Bot", bot)
-			bot.update_openai_assistant()
-
 	def get_params_as_dict(self):
 		if isinstance(self.params, dict):
 			return self.params
